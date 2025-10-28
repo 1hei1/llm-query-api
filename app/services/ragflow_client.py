@@ -28,7 +28,7 @@ class RAGFlowClient:
                 detail="RAGFlow API key is not configured.",
             )
 
-        self.base_url = base_url.rstrip("/")
+        self.base_url = str(base_url).rstrip("/")
         self.api_key = api_key
         self.timeout = timeout
         self.retry_attempts = retry_attempts
