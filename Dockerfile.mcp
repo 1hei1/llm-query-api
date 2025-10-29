@@ -1,0 +1,23 @@
+FROM python:3.11-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
+
+WORKDIR /app
+
+# Install runtime dependencies
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+# Copy source code
+COPY app /app/app
+COPY mcp_server /app/mcp_server
+COPY README_MCP.md /app/README_MCP.md
+COPY mcp-server /usr/local/bin/mcp-server
+RUN chmod +x /usr/local/bin/mcp-server
+
+# Ensure default locale is UTF-8 for stdio transport
+ENV LANG=C.UTF-8
+
+ENTRYPOINT ["mcp-server"]
+CMD ["run", "--transport", "stdio"]

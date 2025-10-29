@@ -96,6 +96,10 @@ curl -X POST http://localhost:8000/rag/answer \
   }'
 ```
 
+## MCP Read-Only Server
+
+A standalone Model Context Protocol server is available in the `mcp_server` package for agents that require read-only access to glossary search endpoints. Refer to [README_MCP.md](./README_MCP.md) for setup instructions, configuration flags, and Docker usage.
+
 ## Running Tests
 
 ```bash
