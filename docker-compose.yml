@@ -1,0 +1,29 @@
+version: "3.9"
+
+services:
+  api:
+    profiles: ["default", "mcp"]
+    image: python:3.11-slim
+    working_dir: /app
+    volumes:
+      - .:/app
+    command: >-
+      bash -c "pip install --no-cache-dir -r requirements.txt && uvicorn app.main:app --host 0.0.0.0 --port 8000"
+    environment:
+      - LLM_API_KEY=${LLM_API_KEY:-}
+    ports:
+      - "8000:8000"
+
+  mcp-server:
+    profiles: ["mcp"]
+    build:
+      context: .
+      dockerfile: Dockerfile.mcp
+    environment:
+      - LLM_API_BASE_URL=${LLM_API_BASE_URL:-http://api:8000}
+      - LLM_API_KEY=${LLM_API_KEY}
+      - MCP_LOG_LEVEL=${MCP_LOG_LEVEL:-INFO}
+    depends_on:
+      - api
+    stdin_open: true
+    tty: true
