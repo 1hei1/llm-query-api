@@ -13,8 +13,7 @@ from mcp_server.server import MCPServerApplication
 
 @pytest.fixture
 def settings(monkeypatch: pytest.MonkeyPatch) -> MCPServerSettings:
-    monkeypatch.setenv("LLM_API_BASE_URL", "https://api.example.com")
-    monkeypatch.setenv("LLM_API_KEY", "test-key")
+    monkeypatch.setenv("MCP_API_BASE_URL", "https://api.example.com")
     return MCPServerSettings()
 
 
@@ -27,116 +26,132 @@ async def app(settings: MCPServerSettings) -> MCPServerApplication:
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_list_glossaries_returns_payload(app: MCPServerApplication, respx_mock: respx.Router) -> None:
-    respx_mock.get("https://api.example.com/glossaries").mock(
-        return_value=Response(200, json={"items": [{"id": "dataset-1", "name": "Main"}], "total": 1})
-    )
-
-    result = await app._handle_list_glossaries(name=None, ctx=None)
-
-    assert result["total"] == 1
-    assert result["items"][0]["dataset_id"] == "dataset-1"
-    assert respx_mock.calls.last.request.headers["Authorization"] == "Bearer test-key"
-
-
-@respx.mock
-@pytest.mark.asyncio
-async def test_get_glossary_falls_back_to_listing(app: MCPServerApplication, respx_mock: respx.Router) -> None:
-    respx_mock.get("https://api.example.com/glossaries/dataset-1").respond(405)
-    respx_mock.get("https://api.example.com/glossaries").mock(
-        return_value=Response(200, json={"items": [{"id": "dataset-1", "name": "Glossary"}], "total": 1})
-    )
-
-    result = await app._handle_get_glossary(dataset_id="dataset-1", ctx=None)
-
-    assert result["dataset_id"] == "dataset-1"
-
-
-@respx.mock
-@pytest.mark.asyncio
-async def test_get_glossary_missing_raises(app: MCPServerApplication, respx_mock: respx.Router) -> None:
-    respx_mock.get("https://api.example.com/glossaries/dataset-404").respond(404)
-    respx_mock.get("https://api.example.com/glossaries").mock(
-        return_value=Response(200, json={"items": [], "total": 0})
-    )
-
-    with pytest.raises(ValueError):
-        await app._handle_get_glossary(dataset_id="dataset-404", ctx=None)
-
-
-@respx.mock
-@pytest.mark.asyncio
-async def test_search_terms_validates_and_calls_retrieve(app: MCPServerApplication, respx_mock: respx.Router) -> None:
+async def test_search_glossary_passthrough(app: MCPServerApplication, respx_mock: respx.Router) -> None:
+    expected_payload = {
+        "chunks": [
+            {"id": "chunk-1", "content": "Definition", "similarity": 0.9, "document_name": "Doc"}
+        ],
+        "doc_aggs": [],
+        "total": 1,
+    }
     route = respx_mock.post("https://api.example.com/glossaries/dataset-1/retrieve").mock(
-        return_value=Response(
-            200,
-            json={
-                "chunks": [
-                    {"id": "chunk-1", "content": "Definition", "similarity": 0.9, "document_name": "Doc"}
-                ],
-                "total": 1,
-            },
-        )
+        return_value=Response(200, json=expected_payload)
     )
 
-    result = await app._handle_search_terms(dataset_id="dataset-1", query="term", top_k=5, ctx=None)
+    result = await app._handle_search_glossary(dataset_id="dataset-1", term="term", top_k=5, ctx=None)
 
-    assert result["total"] == 1
-    assert result["results"][0]["chunk_id"] == "chunk-1"
+    assert result == expected_payload
     payload = json.loads(route.calls.last.request.content.decode())
     assert payload["question"] == "term"
-
-
-@pytest.mark.asyncio
-async def test_search_terms_rejects_long_query(app: MCPServerApplication) -> None:
-    app.settings.max_query_length = 5
-    with pytest.raises(ValueError):
-        await app._handle_search_terms(dataset_id="dataset-1", query="too-long-query", top_k=None, ctx=None)
+    assert payload["top_k"] == 5
+    assert payload["highlight"] is True
+    assert payload["keyword"] is False
 
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_retrieve_definitions_sanitises_terms(app: MCPServerApplication, respx_mock: respx.Router) -> None:
-    route = respx_mock.post("https://api.example.com/glossaries/dataset-1/retrieve").mock(
-        return_value=Response(200, json={"chunks": [], "total": 0})
+async def test_search_glossary_empty_results(app: MCPServerApplication, respx_mock: respx.Router) -> None:
+    expected_payload = {"chunks": [], "doc_aggs": [], "total": 0}
+    respx_mock.post("https://api.example.com/glossaries/dataset-1/retrieve").mock(
+        return_value=Response(200, json=expected_payload)
     )
 
-    await app._handle_retrieve_definitions(dataset_id="dataset-1", terms=[" term a ", "", "term b"], top_k=None, ctx=None)
+    result = await app._handle_search_glossary(dataset_id="dataset-1", term="missing", top_k=None, ctx=None)
 
-    payload = json.loads(route.calls.last.request.content.decode())
-    assert "- term a" in payload["question"]
-    assert "- term b" in payload["question"]
-    assert payload["question"].strip().startswith("Provide glossary definitions")
+    assert result == expected_payload
+    assert result["chunks"] == []
 
 
 @respx.mock
 @pytest.mark.asyncio
-async def test_rate_limit_enforced_per_tool(respx_mock: respx.Router, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("LLM_API_BASE_URL", "https://api.example.com")
-    monkeypatch.setenv("LLM_API_KEY", "test-key")
-    settings = MCPServerSettings(rate_limit_capacity=1, tool_rate_limits={"search_terms": 1})
+async def test_retrieve_docs_passthrough(app: MCPServerApplication, respx_mock: respx.Router) -> None:
+    expected_payload = {
+        "chunks": [],
+        "doc_aggs": [
+            {"doc_id": "doc-1", "doc_name": "Doc 1", "count": 2},
+        ],
+        "total": 2,
+    }
+    route = respx_mock.post("https://api.example.com/glossaries/dataset-1/retrieve").mock(
+        return_value=Response(200, json=expected_payload)
+    )
+
+    result = await app._handle_retrieve_docs(
+        dataset_id="dataset-1",
+        query="definition",
+        top_k=None,
+        keyword=True,
+        highlight=False,
+        ctx=None,
+    )
+
+    assert result == expected_payload
+    payload = json.loads(route.calls.last.request.content.decode())
+    assert payload["keyword"] is True
+    assert payload["highlight"] is False
+
+
+@pytest.mark.asyncio
+async def test_search_glossary_rejects_long_query(app: MCPServerApplication) -> None:
+    app.settings.max_query_length = 5
+    with pytest.raises(ValueError):
+        await app._handle_search_glossary(dataset_id="dataset-1", term="too-long-query", top_k=None, ctx=None)
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_rate_limit_enforced(respx_mock: respx.Router, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MCP_API_BASE_URL", "https://api.example.com")
+    settings = MCPServerSettings(rate_limit_capacity=1, tool_rate_limits={"retrieve_docs": 1})
     app = MCPServerApplication(settings=settings)
     try:
         respx_mock.post("https://api.example.com/glossaries/dataset-1/retrieve").mock(
-            return_value=Response(200, json={"chunks": [], "total": 0})
+            return_value=Response(200, json={"chunks": [], "doc_aggs": [], "total": 0})
         )
-        await app._handle_search_terms(dataset_id="dataset-1", query="term", top_k=None, ctx=None)
+        await app._handle_retrieve_docs(
+            dataset_id="dataset-1",
+            query="term",
+            top_k=None,
+            keyword=False,
+            highlight=False,
+            ctx=None,
+        )
 
         with pytest.raises(ValueError, match="Rate limit"):
-            await app._handle_search_terms(dataset_id="dataset-1", query="term", top_k=None, ctx=None)
+            await app._handle_retrieve_docs(
+                dataset_id="dataset-1",
+                query="term",
+                top_k=None,
+                keyword=False,
+                highlight=False,
+                ctx=None,
+            )
     finally:
         await app.aclose()
+
+
+@respx.mock
+@pytest.mark.asyncio
+async def test_upstream_error_mapped(app: MCPServerApplication, respx_mock: respx.Router) -> None:
+    respx_mock.post("https://api.example.com/glossaries/dataset-1/retrieve").mock(
+        return_value=Response(404, json={"detail": "Dataset not found."})
+    )
+
+    with pytest.raises(ValueError, match="status 404") as exc_info:
+        await app._handle_search_glossary(dataset_id="dataset-1", term="term", top_k=None, ctx=None)
+
+    assert "Dataset not found" in str(exc_info.value)
 
 
 @pytest.mark.asyncio
 async def test_dataset_id_validation(app: MCPServerApplication) -> None:
     with pytest.raises(ValueError):
-        await app._handle_get_glossary(dataset_id="bad id!", ctx=None)
+        await app._handle_search_glossary(dataset_id="bad id!", term="term", top_k=None, ctx=None)
 
 
 @pytest.mark.asyncio
-async def test_registered_tools_are_read_only(app: MCPServerApplication) -> None:
+async def test_registered_tools_are_retrieval_only(app: MCPServerApplication) -> None:
     server = app.create_server()
     tool_names = {tool.name for tool in server._tool_manager.list_tools()}  # type: ignore[attr-defined]
-    assert tool_names == {"list_glossaries", "get_glossary", "search_terms", "retrieve_definitions"}
-    assert all("rag" not in name for name in tool_names)
+    assert tool_names == {"search_glossary", "retrieve_docs"}
+    assert all("answer" not in name and "qa" not in name for name in tool_names)

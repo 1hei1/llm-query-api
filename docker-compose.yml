@@ -20,8 +20,8 @@ services:
       context: .
       dockerfile: Dockerfile.mcp
     environment:
-      - LLM_API_BASE_URL=${LLM_API_BASE_URL:-http://api:8000}
-      - LLM_API_KEY=${LLM_API_KEY}
+      - MCP_API_BASE_URL=${MCP_API_BASE_URL:-http://api:8000}
+      - MCP_API_KEY=${MCP_API_KEY:-}
       - MCP_LOG_LEVEL=${MCP_LOG_LEVEL:-INFO}
     depends_on:
       - api

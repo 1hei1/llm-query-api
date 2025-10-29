@@ -1,13 +1,13 @@
 # MCP Read-Only Glossary Server
 
-This package provides a Model Context Protocol (MCP) server that exposes the existing [`llm-query-api`](./README.md) glossary retrieval features to LLM agents in a read-only manner. The server strictly proxies glossary search operations and **does not** expose any dataset creation, ingestion, deletion, or RAG Q&A capabilities.
+This package provides a Model Context Protocol (MCP) server that exposes the existing [`llm-query-api`](./README.md) retrieval features to LLM agents in a read-only manner. The server strictly proxies glossary search operations and **does not** expose any dataset creation, ingestion, deletion, or generative Q&A capabilities.
 
 ## Features
 
-- ✅ Read-only access to glossary metadata and retrieval endpoints
+- ✅ Direct passthrough to the FastAPI glossary retrieval endpoints (no response post-processing)
 - ✅ Token-bucket rate limiting with configurable defaults and per-tool overrides
 - ✅ Structured JSON logging with audit records for every tool invocation
-- ✅ Input validation for dataset identifiers, query length, and term limits
+- ✅ Input validation for dataset identifiers and query length
 - ✅ Tenacity-based retries, HTTP timeouts, and upstream request correlation IDs
 - ❌ No dataset writes, uploads, or deletions
 - ❌ No RAG/Q&A or generative endpoints
@@ -16,12 +16,10 @@ This package provides a Model Context Protocol (MCP) server that exposes the exi
 
 | Tool | Description |
 | ---- | ----------- |
-| `list_glossaries` | Lists available glossary datasets (optional name filter). |
-| `get_glossary` | Returns metadata for a specific glossary dataset. |
-| `search_terms` | Retrieves glossary chunks relevant to a free-text query. |
-| `retrieve_definitions` | Retrieves glossary definitions for a list of terms. |
+| `search_glossary` | Calls the FastAPI `/glossaries/{dataset_id}/retrieve` endpoint to search for chunks related to a term. The JSON payload from FastAPI is returned verbatim. |
+| `retrieve_docs` | Calls the same retrieval endpoint to return chunk and document aggregation data for an arbitrary query. The upstream JSON payload is returned unchanged. |
 
-All tools require the upstream `llm-query-api` service to be reachable and authenticated with an API key.
+Both tools require a dataset identifier and will surface an error if the upstream API returns a non-2xx status code.
 
 ## Configuration
 
@@ -29,17 +27,19 @@ The server reads configuration from environment variables (values in parentheses
 
 | Variable | Description |
 | -------- | ----------- |
-| `LLM_API_BASE_URL` (`http://127.0.0.1:8000`) | Base URL of the upstream FastAPI service. |
-| `LLM_API_KEY` | **Required.** API key for authenticating with the upstream service. |
+| `MCP_API_BASE_URL` (`http://127.0.0.1:8000`) | Base URL of the upstream FastAPI service. |
+| `MCP_API_KEY` | Optional API key for authenticating with the upstream service. |
 | `MCP_HTTP_TIMEOUT` (`30.0`) | Timeout for outbound HTTP requests (seconds). |
 | `MCP_RETRY_ATTEMPTS` (`3`) | Retry attempts for recoverable upstream failures. |
 | `MCP_RETRY_WAIT` (`0.5`) | Delay between retries (seconds). |
 | `MCP_RATE_LIMIT_CAPACITY` (`10`) | Default number of requests allowed per tool per interval. |
 | `MCP_RATE_LIMIT_INTERVAL_SECONDS` (`60.0`) | Interval length (seconds) for the token bucket. |
-| `MCP_TOOL_RATE_LIMITS` | Optional JSON object with per-tool rate limits, e.g. `{"search_terms": 5}`. |
+| `MCP_TOOL_RATE_LIMITS` | Optional JSON object with per-tool overrides, e.g. `{"search_glossary": 5}`. |
 | `MCP_MAX_QUERY_LENGTH` (`256`) | Maximum character length for free-text queries. |
-| `MCP_MAX_TERMS` (`10`) | Maximum number of terms for `retrieve_definitions`. |
-| `MCP_MAX_TERM_LENGTH` (`128`) | Maximum character length for an individual term. |
+| `MCP_DATASET_ID_PATTERN` (`^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$`) | Regex used to validate dataset IDs. |
+| `MCP_SEARCH_TOP_K` (`8`) | Default `top_k` value when none is supplied. |
+| `MCP_SIMILARITY_THRESHOLD` (`0.2`) | Similarity threshold applied to retrieval requests. |
+| `MCP_VECTOR_SIMILARITY_WEIGHT` (`0.3`) | Vector similarity weight applied to retrieval requests. |
 | `MCP_LOG_LEVEL` (`INFO`) | Log level for the MCP server. |
 
 Add these environment variables to your `.env` file or pass them directly when launching the server.
@@ -76,14 +76,16 @@ Logs are emitted as structured JSON and include a request correlation ID. Audit 
 ```json
 {
   "event": "tool_invocation",
-  "tool": "search_terms",
+  "tool": "search_glossary",
   "status": "success",
   "request_id": "...",
   "duration_ms": 12.4,
   "arguments": {
     "dataset_id": "dataset-1",
     "query_length": 24,
-    "top_k": 5
+    "top_k": 5,
+    "keyword": false,
+    "highlight": true
   }
 }
 ```
@@ -103,13 +105,14 @@ Authentication headers are never written to logs. Only sanitized arguments (leng
         "run"
       ],
       "env": {
-        "LLM_API_BASE_URL": "https://llm-query-api.internal",
-        "LLM_API_KEY": "${LLM_API_KEY}"
+        "MCP_API_BASE_URL": "https://llm-query-api.internal"
       }
     }
   }
 }
 ```
+
+Set `MCP_API_KEY` in the environment if your FastAPI deployment requires authentication.
 
 ## Docker Support
 
@@ -123,7 +126,7 @@ docker build -f Dockerfile.mcp -t llm-query-api-mcp .
 docker compose --profile mcp up
 ```
 
-The Compose profile expects the `LLM_API_KEY` environment variable to be defined locally. The MCP container forwards requests to the API service via the internal Docker network.
+The Compose profile can use `MCP_API_KEY` if authentication is enabled. The MCP container forwards requests to the API service via the internal Docker network.
 
 ## Testing
 
@@ -135,7 +138,6 @@ pytest
 
 ## Security Notes
 
-- An API key (`LLM_API_KEY`) is mandatory; the server refuses to start without it.
-- Only read-only glossary endpoints are exposed. Dataset creation, ingestion, deletion, and `/rag` routes are intentionally blocked.
+- No writes or generative endpoints are exposed through MCP.
 - Input validation, rate limiting, and structured audit logs are in place to discourage abuse and to simplify monitoring.
 - Secrets (e.g., API keys, authorization headers) are never logged.

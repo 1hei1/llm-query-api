@@ -10,12 +10,15 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 class MCPServerSettings(BaseSettings):
     """Settings for the read-only MCP server."""
 
-    llm_api_base_url: AnyHttpUrl = Field(
+    api_base_url: AnyHttpUrl = Field(
         default="http://127.0.0.1:8000",
-        description="Base URL for the upstream llm-query-api service.",
+        description="Base URL for the upstream FastAPI service.",
+        validation_alias=AliasChoices("MCP_API_BASE_URL", "API_BASE_URL", "api_base_url"),
     )
-    llm_api_key: SecretStr = Field(
-        description="API key used to authenticate with the upstream service.",
+    api_key: SecretStr | None = Field(
+        default=None,
+        description="Optional API key used to authenticate with the upstream service.",
+        validation_alias=AliasChoices("MCP_API_KEY", "API_KEY", "api_key"),
     )
     http_timeout: float = Field(
         default=30.0,
@@ -45,13 +48,17 @@ class MCPServerSettings(BaseSettings):
         default=60.0,
         gt=0.0,
         description="Interval length in seconds for rate limiting buckets.",
-        validation_alias=AliasChoices("MCP_RATE_LIMIT_INTERVAL_SECONDS", "RATE_LIMIT_INTERVAL_SECONDS", "rate_limit_interval_seconds"),
+        validation_alias=AliasChoices(
+            "MCP_RATE_LIMIT_INTERVAL_SECONDS",
+            "RATE_LIMIT_INTERVAL_SECONDS",
+            "rate_limit_interval_seconds",
+        ),
     )
     tool_rate_limits: dict[str, int] = Field(
         default_factory=dict,
         description=(
             "Optional per-tool overrides for rate limits. "
-            "Example: {'list_glossaries': 20, 'search_terms': 5}."
+            "Example: {'search_glossary': 20, 'retrieve_docs': 5}."
         ),
         validation_alias=AliasChoices("MCP_TOOL_RATE_LIMITS", "TOOL_RATE_LIMITS", "tool_rate_limits"),
     )
@@ -60,18 +67,6 @@ class MCPServerSettings(BaseSettings):
         ge=1,
         description="Maximum number of characters permitted in free-text queries.",
         validation_alias=AliasChoices("MCP_MAX_QUERY_LENGTH", "MAX_QUERY_LENGTH", "max_query_length"),
-    )
-    max_terms: int = Field(
-        default=10,
-        ge=1,
-        description="Maximum number of terms accepted for definition retrieval.",
-        validation_alias=AliasChoices("MCP_MAX_TERMS", "MAX_TERMS", "max_terms"),
-    )
-    max_term_length: int = Field(
-        default=128,
-        ge=1,
-        description="Maximum number of characters permitted per individual term.",
-        validation_alias=AliasChoices("MCP_MAX_TERM_LENGTH", "MAX_TERM_LENGTH", "max_term_length"),
     )
     dataset_id_pattern: str = Field(
         default=r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$",
@@ -85,13 +80,6 @@ class MCPServerSettings(BaseSettings):
         description="Default top_k value for glossary search operations.",
         validation_alias=AliasChoices("MCP_SEARCH_TOP_K", "SEARCH_TOP_K", "search_top_k"),
     )
-    definition_top_k: int = Field(
-        default=12,
-        ge=1,
-        le=1024,
-        description="Default top_k for definition retrieval across multiple terms.",
-        validation_alias=AliasChoices("MCP_DEFINITION_TOP_K", "DEFINITION_TOP_K", "definition_top_k"),
-    )
     similarity_threshold: float = Field(
         default=0.2,
         ge=0.0,
@@ -104,7 +92,11 @@ class MCPServerSettings(BaseSettings):
         ge=0.0,
         le=1.0,
         description="Vector similarity weighting applied to retrieval requests.",
-        validation_alias=AliasChoices("MCP_VECTOR_SIMILARITY_WEIGHT", "VECTOR_SIMILARITY_WEIGHT", "vector_similarity_weight"),
+        validation_alias=AliasChoices(
+            "MCP_VECTOR_SIMILARITY_WEIGHT",
+            "VECTOR_SIMILARITY_WEIGHT",
+            "vector_similarity_weight",
+        ),
     )
     log_level: str = Field(
         default="INFO",
