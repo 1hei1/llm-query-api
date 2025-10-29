@@ -1,27 +1,21 @@
 from __future__ import annotations
 
+import json
 import re
 from time import perf_counter
 from typing import Any
 
+from httpx import HTTPStatusError
 from mcp.server.fastmcp import Context, FastMCP
-from pydantic import ValidationError
 
 from .audit import log_tool_event
-from .client import LLMQueryAPIClient
+from .client import ReadOnlyAPIClient
 from .config import MCPServerSettings, get_settings
 from .exceptions import RateLimitExceeded
-from .models import (
-    GlossaryListResult,
-    GlossarySummary,
-    RetrievalChunkResult,
-    RetrieveDefinitionsResult,
-    SearchTermsResult,
-)
 from .rate_limiter import TokenBucket
-from .utils import generate_request_id, sanitize_terms
+from .utils import generate_request_id
 
-_ALLOWED_TOOLS = ("list_glossaries", "get_glossary", "search_terms", "retrieve_definitions")
+_ALLOWED_TOOLS = ("search_glossary", "retrieve_docs")
 
 
 class MCPServerApplication:
@@ -31,9 +25,10 @@ class MCPServerApplication:
         self.settings = settings or get_settings()
         self._dataset_regex = re.compile(self.settings.dataset_id_pattern)
         self._rate_limiters = self._build_rate_limiters()
-        self._client = LLMQueryAPIClient(
-            base_url=str(self.settings.llm_api_base_url),
-            api_key=self.settings.llm_api_key.get_secret_value(),
+        api_key = self.settings.api_key.get_secret_value() if self.settings.api_key else None
+        self._client = ReadOnlyAPIClient(
+            base_url=str(self.settings.api_base_url),
+            api_key=api_key,
             timeout=self.settings.http_timeout,
             retry_attempts=self.settings.retry_attempts,
             retry_wait=self.settings.retry_wait,
@@ -46,269 +41,187 @@ class MCPServerApplication:
         """Instantiate and configure the MCP server."""
 
         instructions = (
-            "Read-only glossary access. Available tools: list_glossaries, get_glossary, "
-            "search_terms, retrieve_definitions. No dataset mutations or Q&A are permitted."
+            "Read-only glossary retrieval. Available tools: search_glossary, retrieve_docs. "
+            "Requests are proxied directly to the upstream FastAPI service; no LLM answering is provided."
         )
 
         server = FastMCP(
-            name="llm-query-api-readonly",
+            name="glossary-retrieval-mcp",
             instructions=instructions,
             log_level=self.settings.log_level.upper(),
         )
 
         @server.tool(
-            name="list_glossaries",
-            description="List available glossary datasets. Optionally filter by name substring.",
-        )
-        async def list_glossaries_tool(name: str | None = None, ctx: Context | None = None) -> dict[str, Any]:
-            return await self._handle_list_glossaries(name=name, ctx=ctx)
-
-        @server.tool(
-            name="get_glossary",
-            description="Fetch a glossary dataset by ID and return its metadata.",
-        )
-        async def get_glossary_tool(dataset_id: str, ctx: Context | None = None) -> dict[str, Any]:
-            return await self._handle_get_glossary(dataset_id=dataset_id, ctx=ctx)
-
-        @server.tool(
-            name="search_terms",
+            name="search_glossary",
             description=(
-                "Search glossary content for passages related to a query. "
-                "Returns matching chunks with similarity scores."
+                "Search glossary content for passages related to a term. "
+                "Returns the upstream FastAPI response unchanged."
             ),
         )
-        async def search_terms_tool(
+        async def search_glossary_tool(
             dataset_id: str,
-            q: str,
+            term: str,
             top_k: int | None = None,
             ctx: Context | None = None,
-        ) -> dict[str, Any]:
-            return await self._handle_search_terms(dataset_id=dataset_id, query=q, top_k=top_k, ctx=ctx)
+        ) -> Any:
+            return await self._handle_search_glossary(dataset_id=dataset_id, term=term, top_k=top_k, ctx=ctx)
 
         @server.tool(
-            name="retrieve_definitions",
+            name="retrieve_docs",
             description=(
-                "Retrieve glossary definitions for one or more terms using semantic similarity."
+                "Retrieve glossary documents and chunk metadata for a query. "
+                "Returns the upstream FastAPI response unchanged."
             ),
         )
-        async def retrieve_definitions_tool(
+        async def retrieve_docs_tool(
             dataset_id: str,
-            terms: list[str],
+            query: str,
             top_k: int | None = None,
+            keyword: bool = False,
+            highlight: bool = False,
             ctx: Context | None = None,
-        ) -> dict[str, Any]:
-            return await self._handle_retrieve_definitions(
+        ) -> Any:
+            return await self._handle_retrieve_docs(
                 dataset_id=dataset_id,
-                terms=terms,
+                query=query,
                 top_k=top_k,
+                keyword=keyword,
+                highlight=highlight,
                 ctx=ctx,
             )
 
         return server
 
-    async def _handle_list_glossaries(self, *, name: str | None, ctx: Context | None) -> dict[str, Any]:
-        request_id = generate_request_id()
-        await self._enforce_rate_limit("list_glossaries")
-        start = perf_counter()
-
-        filtered_name = name.strip() if name else None
-        audit_args = {"name_filter": bool(filtered_name)}
-
-        success = False
-        try:
-            payload = await self._client.list_glossaries(request_id=request_id, name=filtered_name)
-            items = [GlossarySummary.from_payload(item) for item in payload.get("items", [])]
-            total = int(payload.get("total", len(items)))
-            result = GlossaryListResult(items=items, total=total)
-            success = True
-            return result.model_dump(mode="python", exclude_none=True)
-        except Exception as exc:  # pragma: no cover - re-raised for MCP error handling
-            log_tool_event(
-                tool="list_glossaries",
-                request_id=request_id,
-                status="error",
-                duration_ms=(perf_counter() - start) * 1000,
-                arguments=audit_args,
-                context=ctx,
-                error=str(exc),
-            )
-            raise
-        finally:
-            if success:
-                log_tool_event(
-                    tool="list_glossaries",
-                    request_id=request_id,
-                    status="success",
-                    duration_ms=(perf_counter() - start) * 1000,
-                    arguments=audit_args,
-                    context=ctx,
-                )
-
-    async def _handle_get_glossary(self, *, dataset_id: str, ctx: Context | None) -> dict[str, Any]:
+    async def _handle_search_glossary(
+        self,
+        *,
+        dataset_id: str,
+        term: str,
+        top_k: int | None,
+        ctx: Context | None,
+    ) -> Any:
         validated_id = self._validate_dataset_id(dataset_id)
-        request_id = generate_request_id()
-        await self._enforce_rate_limit("get_glossary")
-        start = perf_counter()
-        audit_args = {"dataset_id": validated_id}
+        validated_query = self._validate_query(term)
+        use_top_k = self._normalize_top_k(top_k or self.settings.search_top_k)
 
-        success = False
-        try:
-            data = await self._client.fetch_glossary(request_id=request_id, dataset_id=validated_id)
-            if not data:
-                raise ValueError(f"Glossary dataset '{validated_id}' was not found.")
-            summary = GlossarySummary.from_payload(data)
-            success = True
-            return summary.model_dump(mode="python", exclude_none=True)
-        except Exception as exc:  # pragma: no cover - re-raised for MCP error handling
-            log_tool_event(
-                tool="get_glossary",
-                request_id=request_id,
-                status="error",
-                duration_ms=(perf_counter() - start) * 1000,
-                arguments=audit_args,
-                context=ctx,
-                error=str(exc),
-            )
-            raise
-        finally:
-            if success:
-                log_tool_event(
-                    tool="get_glossary",
-                    request_id=request_id,
-                    status="success",
-                    duration_ms=(perf_counter() - start) * 1000,
-                    arguments=audit_args,
-                    context=ctx,
-                )
+        return await self._invoke_retrieval_tool(
+            tool_name="search_glossary",
+            dataset_id=validated_id,
+            query=validated_query,
+            top_k=use_top_k,
+            keyword=False,
+            highlight=True,
+            ctx=ctx,
+        )
 
-    async def _handle_search_terms(
+    async def _handle_retrieve_docs(
         self,
         *,
         dataset_id: str,
         query: str,
         top_k: int | None,
+        keyword: bool,
+        highlight: bool,
         ctx: Context | None,
-    ) -> dict[str, Any]:
+    ) -> Any:
         validated_id = self._validate_dataset_id(dataset_id)
         validated_query = self._validate_query(query)
         use_top_k = self._normalize_top_k(top_k or self.settings.search_top_k)
 
-        request_id = generate_request_id()
-        await self._enforce_rate_limit("search_terms")
-        start = perf_counter()
-        audit_args = {
-            "dataset_id": validated_id,
-            "query_length": len(validated_query),
-            "top_k": use_top_k,
-        }
+        return await self._invoke_retrieval_tool(
+            tool_name="retrieve_docs",
+            dataset_id=validated_id,
+            query=validated_query,
+            top_k=use_top_k,
+            keyword=keyword,
+            highlight=highlight,
+            ctx=ctx,
+        )
 
-        success = False
-        try:
-            payload = await self._client.search_glossary(
-                request_id=request_id,
-                dataset_id=validated_id,
-                question=validated_query,
-                top_k=use_top_k,
-                similarity_threshold=self.settings.similarity_threshold,
-                vector_similarity_weight=self.settings.vector_similarity_weight,
-                keyword=False,
-                highlight=True,
-            )
-            results, total = self._parse_retrieval(payload)
-            response = SearchTermsResult(
-                dataset_id=validated_id,
-                query=validated_query,
-                total=total,
-                results=results,
-            )
-            success = True
-            return response.model_dump(mode="python", exclude_none=True)
-        except Exception as exc:  # pragma: no cover - re-raised for MCP error handling
-            log_tool_event(
-                tool="search_terms",
-                request_id=request_id,
-                status="error",
-                duration_ms=(perf_counter() - start) * 1000,
-                arguments=audit_args,
-                context=ctx,
-                error=str(exc),
-            )
-            raise
-        finally:
-            if success:
-                log_tool_event(
-                    tool="search_terms",
-                    request_id=request_id,
-                    status="success",
-                    duration_ms=(perf_counter() - start) * 1000,
-                    arguments=audit_args,
-                    context=ctx,
-                )
-
-    async def _handle_retrieve_definitions(
+    async def _invoke_retrieval_tool(
         self,
         *,
+        tool_name: str,
         dataset_id: str,
-        terms: list[str],
-        top_k: int | None,
+        query: str,
+        top_k: int,
+        keyword: bool,
+        highlight: bool,
         ctx: Context | None,
-    ) -> dict[str, Any]:
-        validated_id = self._validate_dataset_id(dataset_id)
-        normalized_terms = self._validate_terms(terms)
-        use_top_k = self._normalize_top_k(top_k or max(self.settings.definition_top_k, len(normalized_terms)))
-        question = self._build_definition_prompt(normalized_terms)
-
+    ) -> Any:
         request_id = generate_request_id()
-        await self._enforce_rate_limit("retrieve_definitions")
+        await self._enforce_rate_limit(tool_name)
         start = perf_counter()
         audit_args = {
-            "dataset_id": validated_id,
-            "term_count": len(normalized_terms),
-            "top_k": use_top_k,
+            "dataset_id": dataset_id,
+            "query_length": len(query),
+            "top_k": top_k,
+            "keyword": keyword,
+            "highlight": highlight,
         }
 
-        success = False
         try:
-            payload = await self._client.search_glossary(
+            payload = await self._client.retrieve_glossary(
                 request_id=request_id,
-                dataset_id=validated_id,
-                question=question,
-                top_k=use_top_k,
+                dataset_id=dataset_id,
+                question=query,
+                top_k=top_k,
                 similarity_threshold=self.settings.similarity_threshold,
                 vector_similarity_weight=self.settings.vector_similarity_weight,
-                keyword=False,
-                highlight=True,
+                keyword=keyword,
+                highlight=highlight,
             )
-            results, total = self._parse_retrieval(payload)
-            response = RetrieveDefinitionsResult(
-                dataset_id=validated_id,
-                terms=normalized_terms,
-                total=total,
-                results=results,
-            )
-            success = True
-            return response.model_dump(mode="python", exclude_none=True)
         except Exception as exc:  # pragma: no cover - re-raised for MCP error handling
+            duration_ms = (perf_counter() - start) * 1000
+            error_message = self._format_http_error(exc) if isinstance(exc, HTTPStatusError) else str(exc)
             log_tool_event(
-                tool="retrieve_definitions",
+                tool=tool_name,
                 request_id=request_id,
                 status="error",
-                duration_ms=(perf_counter() - start) * 1000,
+                duration_ms=duration_ms,
                 arguments=audit_args,
                 context=ctx,
-                error=str(exc),
+                error=error_message,
             )
+            if isinstance(exc, HTTPStatusError):
+                raise ValueError(error_message) from exc
             raise
-        finally:
-            if success:
-                log_tool_event(
-                    tool="retrieve_definitions",
-                    request_id=request_id,
-                    status="success",
-                    duration_ms=(perf_counter() - start) * 1000,
-                    arguments=audit_args,
-                    context=ctx,
-                )
+        else:
+            duration_ms = (perf_counter() - start) * 1000
+            log_tool_event(
+                tool=tool_name,
+                request_id=request_id,
+                status="success",
+                duration_ms=duration_ms,
+                arguments=audit_args,
+                context=ctx,
+            )
+            return payload
+
+    @staticmethod
+    def _format_http_error(exc: HTTPStatusError) -> str:
+        status_code = exc.response.status_code if exc.response is not None else 0
+        detail: str = ""
+        if exc.response is not None:
+            try:
+                payload = exc.response.json()
+            except json.JSONDecodeError:
+                detail = exc.response.text or ""
+            else:
+                if isinstance(payload, dict):
+                    raw_detail = payload.get("detail") or payload.get("message")
+                    if raw_detail is None:
+                        detail = json.dumps(payload)
+                    elif isinstance(raw_detail, (str, int, float)):
+                        detail = str(raw_detail)
+                    else:
+                        detail = json.dumps(raw_detail)
+                else:
+                    detail = str(payload)
+        detail = detail.strip()
+        if not detail:
+            detail = exc.response.reason_phrase if exc.response is not None else exc.args[0]
+        return f"Upstream request failed with status {status_code}: {detail}".strip()
 
     def _validate_dataset_id(self, dataset_id: str) -> str:
         value = (dataset_id or "").strip()
@@ -328,41 +241,10 @@ class MCPServerApplication:
             )
         return value
 
-    def _validate_terms(self, terms: list[str]) -> list[str]:
-        normalized = sanitize_terms(terms)
-        if not normalized:
-            raise ValueError("At least one term is required.")
-        if len(normalized) > self.settings.max_terms:
-            raise ValueError(f"A maximum of {self.settings.max_terms} terms may be requested at once.")
-        for term in normalized:
-            if len(term) > self.settings.max_term_length:
-                raise ValueError(
-                    f"Term '{term}' exceeds maximum length of {self.settings.max_term_length} characters."
-                )
-        return normalized
-
-    def _build_definition_prompt(self, terms: list[str]) -> str:
-        header = "Provide glossary definitions for the following terms:"
-        bullet_list = "\n".join(f"- {term}" for term in terms)
-        return f"{header}\n{bullet_list}"
-
     def _normalize_top_k(self, value: int) -> int:
         if value <= 0:
             raise ValueError("top_k must be greater than zero")
         return min(value, 1024)
-
-    def _parse_retrieval(self, payload: dict[str, Any]) -> tuple[list[RetrievalChunkResult], int]:
-        chunks_payload = payload.get("chunks") or payload.get("results") or []
-        results: list[RetrievalChunkResult] = []
-        for raw in chunks_payload:
-            data = dict(raw)
-            data.setdefault("id", data.get("chunk_id") or data.get("chunkId") or data.get("document_id", ""))
-            try:
-                results.append(RetrievalChunkResult.model_validate(data))
-            except ValidationError:  # pragma: no cover - skip malformed chunks
-                continue
-        total = int(payload.get("total", len(results)))
-        return results, total
 
     async def _enforce_rate_limit(self, tool_name: str) -> None:
         limiter = self._rate_limiters.get(tool_name)

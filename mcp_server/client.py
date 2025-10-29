@@ -10,21 +10,18 @@ from tenacity import AsyncRetrying, retry_if_exception_type, stop_after_attempt,
 logger = logging.getLogger("mcp_server.client")
 
 
-class LLMQueryAPIClient:
-    """Minimal async client for the upstream llm-query-api service."""
+class ReadOnlyAPIClient:
+    """Minimal async client for the upstream read-only glossary service."""
 
     def __init__(
         self,
         *,
         base_url: str,
-        api_key: str,
+        api_key: str | None,
         timeout: float,
         retry_attempts: int,
         retry_wait: float,
     ) -> None:
-        if not api_key:
-            raise ValueError("API key is required for MCP server upstream calls")
-
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
         self.timeout = timeout
@@ -37,11 +34,12 @@ class LLMQueryAPIClient:
 
     def _headers(self, request_id: str, *, include_json: bool = False) -> dict[str, str]:
         headers = {
-            "Authorization": f"Bearer {self.api_key}",
             "Accept": "application/json",
-            "User-Agent": "llm-query-api-mcp/1.0",
+            "User-Agent": "glossary-mcp/1.0",
             "X-Request-ID": request_id,
         }
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
         if include_json:
             headers["Content-Type"] = "application/json"
         return headers
@@ -72,40 +70,12 @@ class LLMQueryAPIClient:
                     json=json_payload,
                     headers=headers,
                 )
-                # For 5xx propagate HTTPStatusError to trigger retry
                 if response.status_code >= 500:
                     response.raise_for_status()
                 return response
         raise RuntimeError("Retry loop unexpectedly exhausted")
 
-    async def list_glossaries(self, *, request_id: str, name: str | None = None) -> dict[str, Any]:
-        params = {"name": name} if name else None
-        response = await self._request("GET", "/glossaries", request_id=request_id, params=params)
-        if response.status_code >= 400:
-            response.raise_for_status()
-        return self._json(response)
-
-    async def fetch_glossary(self, *, request_id: str, dataset_id: str) -> dict[str, Any] | None:
-        response = await self._request("GET", f"/glossaries/{dataset_id}", request_id=request_id)
-        if response.status_code in {404, 405, 501}:
-            logger.debug(
-                "Direct glossary fetch returned status %s, falling back to list",
-                response.status_code,
-            )
-        elif response.status_code >= 400:
-            response.raise_for_status()
-            return self._json(response)
-        else:
-            return self._json(response)
-
-        listing = await self.list_glossaries(request_id=request_id)
-        for item in listing.get("items", []):
-            identifier = item.get("dataset_id") or item.get("id")
-            if identifier == dataset_id:
-                return item
-        return None
-
-    async def search_glossary(
+    async def retrieve_glossary(
         self,
         *,
         request_id: str,
@@ -116,7 +86,7 @@ class LLMQueryAPIClient:
         vector_similarity_weight: float,
         keyword: bool,
         highlight: bool,
-    ) -> dict[str, Any]:
+    ) -> Any:
         payload = {
             "question": question,
             "top_k": top_k,
@@ -136,7 +106,7 @@ class LLMQueryAPIClient:
         return self._json(response)
 
     @staticmethod
-    def _json(response: httpx.Response) -> dict[str, Any]:
+    def _json(response: httpx.Response) -> Any:
         try:
             return response.json()
         except json.JSONDecodeError as exc:  # pragma: no cover - defensive guard
