@@ -8,7 +8,7 @@ from pydantic import BaseModel, ConfigDict, Field
 class GlossaryCreateRequest(BaseModel):
     name: str = Field(..., min_length=1)
     description: Optional[str] = None
-    chunk_method: Optional[Literal["naive", "manual"]] = Field(default=None)
+    chunk_method: Optional[Literal["naive", "manual", "qa"]] = Field(default=None)
 
 
 class DatasetResource(BaseModel):

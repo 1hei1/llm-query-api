@@ -107,11 +107,18 @@ class RAGFlowClient:
         description: Optional[str] = None,
         chunk_method: Optional[str] = None,
     ) -> dict[str, Any]:
-        listings = await self.list_datasets(name=name)
-        for item in listings.get("data", []):
-            if item.get("name", "").lower() == name.lower():
-                return item
-
+        try:
+            listings = await self.list_datasets(name=name)
+            for item in listings.get("data", []):
+                if item.get("name", "").lower() == name.lower():
+                    return item
+        except HTTPException as exc:
+            #捕获到没有数据表异常
+            if exc.status_code in [status.HTTP_502_BAD_GATEWAY]:
+                pass
+            else:
+                #除去数据库不存在错误，其他重新抛出错误
+                raise exc
         payload = {
             "name": name,
         }
@@ -120,9 +127,12 @@ class RAGFlowClient:
         if chunk_method:
             payload["chunk_method"] = chunk_method
 
+        headers = {"Content-Type": "application/json"}
+
         response = await self._request_json(
             "POST",
             "/api/v1/datasets",
+            headers=headers,
             json=payload,
         )
         return response.get("data", {})
